@@ -49,6 +49,23 @@ func main() {
 	}
 
 	evaluate(*input)
+	// file, _ := os.Open(*input)
+	// fileSize, _ := file.Stat()
+
+	// for i :
+
+	// i := 0
+	// // l := 0
+	// for {
+	// 	buf := readChunkFileFromOffsetToNewLine(file, int64(i), 50)
+	// 	print(string(buf))
+	// 	// l += len(buf)
+	// 	i += 50
+	// 	if string(buf) == "" {
+	// 		break
+	// 	}
+	// }
+	// fmt.Println(l)
 
 	if *memprofile != "" {
 		f, err := os.Create("./profiles/" + *memprofile)
@@ -109,57 +126,90 @@ func readFileLineByLineIntoAMap(filepath string) (map[string]cityTemperatureInfo
 	if err != nil {
 		panic(err)
 	}
-	defer file.Close()
+	fi, _ := file.Stat()
+	fileSize := fi.Size()
+	file.Close()
 
 	mapOfTemp := make(map[string]cityTemperatureInfo)
 	resultStream := make(chan map[string]cityTemperatureInfo, 10)
 	chunkStream := make(chan []byte, 15)
+	offSetStream := make(chan int64, 15)
 	chunkSize := 64 * 1024 * 1024
-	var wg sync.WaitGroup
+	var processWg sync.WaitGroup
+	var readingWg sync.WaitGroup
 
 	// spawn workers to consume (process) file chunks read
-	for i := 0; i < runtime.NumCPU()-1; i++ {
-		wg.Add(1)
+	maxCPU := runtime.NumCPU() - 1
+	readFileCPU := maxCPU / 3
+	processCPU := maxCPU - readFileCPU
+	for i := 0; i < processCPU; i++ {
+		processWg.Add(1)
 		go func() {
 			for chunk := range chunkStream {
 				processReadChunk(chunk, resultStream)
 			}
-			wg.Done()
+			processWg.Done()
 		}()
 	}
 
-	// spawn a goroutine to read file in chunks and send it to the chunk channel for further processing
-	go func() {
-		buf := make([]byte, chunkSize)
-		leftover := make([]byte, 0, chunkSize)
-		for {
-			readTotal, err := file.Read(buf)
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				}
-				panic(err)
+	for i := 0; i < readFileCPU; i++ {
+		readingWg.Add(1)
+		go func() {
+			file, _ := os.Open(filepath)
+			for offset := range offSetStream {
+				toSend, _ := readChunkFileFromOffsetToNewLine(file, offset, chunkSize)
+				chunkStream <- toSend
 			}
-			buf = buf[:readTotal]
+			readingWg.Done()
+		}()
+	}
 
-			toSend := make([]byte, readTotal)
-			copy(toSend, buf)
-
-			lastNewLineIndex := bytes.LastIndex(buf, []byte{'\n'})
-
-			toSend = append(leftover, buf[:lastNewLineIndex+1]...)
-			leftover = make([]byte, len(buf[lastNewLineIndex+1:]))
-			copy(leftover, buf[lastNewLineIndex+1:])
-
-			chunkStream <- toSend
-
+	// calculate offset
+	go func() {
+		var i int64
+		for i <= fileSize {
+			offSetStream <- i
+			i += int64(chunkSize)
 		}
-		close(chunkStream)
-
-		// wait for all chunks to be proccessed before closing the result stream
-		wg.Wait()
-		close(resultStream)
+		close(offSetStream)
 	}()
+	readingWg.Wait()
+	close(chunkStream)
+	processWg.Wait()
+	close(resultStream)
+
+	// spawn a goroutine to read file in chunks and send it to the chunk channel for further processing
+	// go func() {
+	// 	buf := make([]byte, chunkSize)
+	// 	leftover := make([]byte, 0, chunkSize)
+	// 	for {
+	// 		readTotal, err := file.Read(buf)
+	// 		if err != nil {
+	// 			if errors.Is(err, io.EOF) {
+	// 				break
+	// 			}
+	// 			panic(err)
+	// 		}
+	// 		buf = buf[:readTotal]
+
+	// 		toSend := make([]byte, readTotal)
+	// 		copy(toSend, buf)
+
+	// 		lastNewLineIndex := bytes.LastIndexByte(buf, '\n')
+
+	// 		toSend = append(leftover, buf[:lastNewLineIndex+1]...)
+	// 		leftover = make([]byte, len(buf[lastNewLineIndex+1:]))
+	// 		copy(leftover, buf[lastNewLineIndex+1:])
+
+	// 		chunkStream <- toSend
+
+	// 	}
+	// 	close(chunkStream)
+
+	// 	// wait for all chunks to be proccessed before closing the result stream
+	// 	wg.Wait()
+	// 	close(resultStream)
+	// }()
 
 	// process all city temperatures derived after processing the file chunks
 	for t := range resultStream {
@@ -255,4 +305,44 @@ func customStringToIntParser(input string) (output int64) {
 		return -output
 	}
 	return
+}
+
+func readChunkFileFromOffsetToNewLine(file *os.File, offset int64, chunkSize int) ([]byte, bool) {
+	file.Seek(offset, 0)
+
+	if offset != 0 {
+		b := make([]byte, 1)
+		shift := 0
+		for {
+			_, err := file.Read(b)
+			if err != nil && errors.Is(err, io.EOF) {
+				return []byte{}, true
+			}
+			shift++
+			if bytes.Equal(b, []byte{'\n'}) {
+				break
+			}
+		}
+		chunkSize -= shift
+	}
+
+	// print(chunkSize)
+	buf := make([]byte, chunkSize)
+	readTotal, err := file.Read(buf)
+	buf = buf[:readTotal]
+	if err != nil && errors.Is(err, io.EOF) {
+		return buf, true
+	}
+	b := make([]byte, 1)
+	for {
+		_, err := file.Read(b)
+		if err != nil && errors.Is(err, io.EOF) {
+			return buf, true
+		}
+		buf = append(buf, b...)
+		if bytes.Equal(b, []byte{'\n'}) {
+			break
+		}
+	}
+	return buf, false
 }
