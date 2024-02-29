@@ -49,23 +49,6 @@ func main() {
 	}
 
 	evaluate(*input)
-	// file, _ := os.Open(*input)
-	// fileSize, _ := file.Stat()
-
-	// for i :
-
-	// i := 0
-	// // l := 0
-	// for {
-	// 	buf := readChunkFileFromOffsetToNewLine(file, int64(i), 50)
-	// 	print(string(buf))
-	// 	// l += len(buf)
-	// 	i += 50
-	// 	if string(buf) == "" {
-	// 		break
-	// 	}
-	// }
-	// fmt.Println(l)
 
 	if *memprofile != "" {
 		f, err := os.Create("./profiles/" + *memprofile)
@@ -135,32 +118,33 @@ func readFileLineByLineIntoAMap(filepath string) (map[string]cityTemperatureInfo
 	chunkStream := make(chan []byte, 15)
 	offSetStream := make(chan int64, 15)
 	chunkSize := 64 * 1024 * 1024
-	var processWg sync.WaitGroup
-	var readingWg sync.WaitGroup
+
+	var splitWg sync.WaitGroup
+	var mapWg sync.WaitGroup
 
 	// spawn workers to consume (process) file chunks read
-	maxCPU := runtime.NumCPU() - 1
-	readFileCPU := maxCPU / 3
-	processCPU := maxCPU - readFileCPU
+	// maxCPU := runtime.NumCPU() - 1
+	readFileCPU := 3
+	processCPU := 3
 	for i := 0; i < processCPU; i++ {
-		processWg.Add(1)
+		mapWg.Add(1)
 		go func() {
 			for chunk := range chunkStream {
 				processReadChunk(chunk, resultStream)
 			}
-			processWg.Done()
+			mapWg.Done()
 		}()
 	}
 
 	for i := 0; i < readFileCPU; i++ {
-		readingWg.Add(1)
+		splitWg.Add(1)
 		go func() {
 			file, _ := os.Open(filepath)
 			for offset := range offSetStream {
 				toSend, _ := readChunkFileFromOffsetToNewLine(file, offset, chunkSize)
 				chunkStream <- toSend
 			}
-			readingWg.Done()
+			splitWg.Done()
 		}()
 	}
 
@@ -173,64 +157,37 @@ func readFileLineByLineIntoAMap(filepath string) (map[string]cityTemperatureInfo
 		}
 		close(offSetStream)
 	}()
-	readingWg.Wait()
-	close(chunkStream)
-	processWg.Wait()
-	close(resultStream)
-
-	// spawn a goroutine to read file in chunks and send it to the chunk channel for further processing
-	// go func() {
-	// 	buf := make([]byte, chunkSize)
-	// 	leftover := make([]byte, 0, chunkSize)
-	// 	for {
-	// 		readTotal, err := file.Read(buf)
-	// 		if err != nil {
-	// 			if errors.Is(err, io.EOF) {
-	// 				break
-	// 			}
-	// 			panic(err)
-	// 		}
-	// 		buf = buf[:readTotal]
-
-	// 		toSend := make([]byte, readTotal)
-	// 		copy(toSend, buf)
-
-	// 		lastNewLineIndex := bytes.LastIndexByte(buf, '\n')
-
-	// 		toSend = append(leftover, buf[:lastNewLineIndex+1]...)
-	// 		leftover = make([]byte, len(buf[lastNewLineIndex+1:]))
-	// 		copy(leftover, buf[lastNewLineIndex+1:])
-
-	// 		chunkStream <- toSend
-
-	// 	}
-	// 	close(chunkStream)
-
-	// 	// wait for all chunks to be proccessed before closing the result stream
-	// 	wg.Wait()
-	// 	close(resultStream)
-	// }()
 
 	// process all city temperatures derived after processing the file chunks
-	for t := range resultStream {
-		for city, tempInfo := range t {
-			if val, ok := mapOfTemp[city]; ok {
-				val.count += tempInfo.count
-				val.sum += tempInfo.sum
-				if tempInfo.min < val.min {
-					val.min = tempInfo.min
-				}
+	var reduceWg sync.WaitGroup
+	go func() {
+		reduceWg.Add(1)
+		for t := range resultStream {
+			for city, tempInfo := range t {
+				if val, ok := mapOfTemp[city]; ok {
+					val.count += tempInfo.count
+					val.sum += tempInfo.sum
+					if tempInfo.min < val.min {
+						val.min = tempInfo.min
+					}
 
-				if tempInfo.max > val.max {
-					val.max = tempInfo.max
+					if tempInfo.max > val.max {
+						val.max = tempInfo.max
+					}
+					mapOfTemp[city] = val
+				} else {
+					mapOfTemp[city] = tempInfo
 				}
-				mapOfTemp[city] = val
-			} else {
-				mapOfTemp[city] = tempInfo
 			}
 		}
-	}
+		reduceWg.Done()
+	}()
 
+	splitWg.Wait()
+	close(chunkStream)
+	mapWg.Wait()
+	close(resultStream)
+	reduceWg.Wait()
 	return mapOfTemp, nil
 }
 
@@ -326,7 +283,6 @@ func readChunkFileFromOffsetToNewLine(file *os.File, offset int64, chunkSize int
 		chunkSize -= shift
 	}
 
-	// print(chunkSize)
 	buf := make([]byte, chunkSize)
 	readTotal, err := file.Read(buf)
 	buf = buf[:readTotal]
